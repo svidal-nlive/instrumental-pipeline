@@ -1,0 +1,76 @@
+# version: "3.9"
+---
+services:
+  backend:
+    build: ./backend
+    container_name: backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    depends_on:
+      - db
+      - redis
+      - minio
+      - spleeter  # Ensure Spleeter service starts first
+
+  celery_worker:
+    build: ./backend
+    container_name: celery_worker
+    command: celery -A app.celery_worker.celery_app worker --loglevel=info
+    depends_on:
+      - redis
+      - backend
+    env_file:
+      - ./backend/.env
+
+  db:
+    image: postgres:15
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pipeline_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:latest
+    container_name: redis_cache
+    restart: always
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio
+    container_name: minio_storage
+    restart: always
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: supersecret
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+  spleeter:
+    build: ./spleeter_service  # Build from our custom Dockerfile
+    container_name: spleeter
+    ports:
+      - "5001:5001"
+    environment:
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=supersecret
+    volumes:
+      - spleeter_data:/spleeter_audio
+
+volumes:
+  postgres_data:
+  minio_data:
+  spleeter_data:

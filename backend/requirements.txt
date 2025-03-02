@@ -1,0 +1,9 @@
+fastapi[all]
+uvicorn
+sqlalchemy
+asyncpg
+redis
+python-dotenv
+minio
+celery
+requests
