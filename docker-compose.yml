@@ -7,31 +7,43 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ./backend/.env
+      - .env
+    working_dir: /app
     depends_on:
       - db
       - redis
       - minio
-      - spleeter  # Ensure Spleeter service starts first
+      - spleeter
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+    user: "${PUID}:${PGID}"
+    volumes:
+      - ./audio_files:/app/audio_files  # ✅ Mounted inside working directory
 
   celery_worker:
     build: ./backend
     container_name: celery_worker
     command: celery -A app.celery_worker.celery_app worker --loglevel=info
+    working_dir: /app
     depends_on:
       - redis
       - backend
     env_file:
-      - ./backend/.env
+      - .env
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+    user: "${PUID}:${PGID}"
+    volumes:
+      - ./audio_files:/app/audio_files  # ✅ Mounted inside working directory
 
   db:
     image: postgres:15
     container_name: postgres_db
     restart: always
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: pipeline_db
+    env_file:
+      - .env
     ports:
       - "5432:5432"
     volumes:
@@ -51,24 +63,31 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: supersecret
+    env_file:
+      - .env
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
 
   spleeter:
-    build: ./spleeter_service  # Build from our custom Dockerfile
+    build: ./spleeter_service
     container_name: spleeter
     ports:
       - "5001:5001"
+    env_file:
+      - .env
     environment:
-      - MINIO_ENDPOINT=http://minio:9000
-      - MINIO_ACCESS_KEY=admin
-      - MINIO_SECRET_KEY=supersecret
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - MODEL_DIR=/spleeter_service/pretrained_models
+    user: "${PUID}:${PGID}"
+    working_dir: /spleeter_service
     volumes:
-      - spleeter_data:/spleeter_audio
+#       - ./spleeter_models:/root/.cache/spleeter
+      - ./spleeter_data:/spleeter_service/spleeter_audio
+      - ./audio_files:/spleeter_service/audio_files
+      - ./pretrained_models:/spleeter_service/pretrained_models  # ✅ Ensures correct ownership
+    command: ["sh", "-c", "chown -R 1000:1000 /spleeter_service/pretrained_models && python3 -m uvicorn spleeter_api:app --host 0.0.0.0 --port 5001"]
 
 volumes:
   postgres_data:

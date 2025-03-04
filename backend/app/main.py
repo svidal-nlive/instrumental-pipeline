@@ -1,89 +1,136 @@
-from fastapi import FastAPI, Depends, File, UploadFile, Query, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from minio import Minio
-import asyncpg
-import redis
 import os
-import subprocess
-from app.database import redis_client, DATABASE_URL
-from app.celery_worker import process_file
-from celery.result import AsyncResult
+import uuid
+import requests
+from typing import List
+import re  # 🔹 Added for snake_case conversion
+import redis  # 🔹 Import Redis for status tracking
 
 app = FastAPI()
 
-SPLEETER_URL = "http://spleeter:5001/process"
+# 📌 MinIO Configuration
+MINIO_ENDPOINT = "http://minio:9000"
+MINIO_ACCESS_KEY = "admin"
+MINIO_SECRET_KEY = "supersecret"
+BUCKETS = ["original-files", "processed-stems", "final-instrumentals"]
 
-# MinIO Client
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "supersecret")
+# 📌 Spleeter Service URL
+SPLEETER_SERVICE_URL = "http://spleeter:5001/separate"
 
+# 📌 Redis Configuration
+REDIS_HOST = "redis"
+REDIS_PORT = 6379
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# 📌 Initialize MinIO Client
 minio_client = Minio(
     "minio:9000",
     access_key=MINIO_ACCESS_KEY,
     secret_key=MINIO_SECRET_KEY,
-    secure=False  # Set to True if using HTTPS
+    secure=False
 )
 
-BUCKET_NAME = "instrumentals"
+# 📌 Ensure MinIO Buckets Exist
+def create_buckets():
+    for bucket in BUCKETS:
+        if not minio_client.bucket_exists(bucket):
+            minio_client.make_bucket(bucket)
 
-# Ensure bucket exists
-if not minio_client.bucket_exists(BUCKET_NAME):
-    minio_client.make_bucket(BUCKET_NAME)
+create_buckets()
 
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Instrumental Pipeline API!"}
+# 📌 Utility Function: Convert Filename to Snake Case
+def to_snake_case(filename: str) -> str:
+    """ Converts a filename to snake_case and removes special characters. """
+    base_name, ext = os.path.splitext(filename)
+    base_name = re.sub(r'[\s\-]+', '_', base_name)  # Replace spaces/hyphens with underscores
+    base_name = re.sub(r'[^a-zA-Z0-9_]', '', base_name)  # Remove special characters
+    return f"{base_name}{ext}"
 
-@app.get("/health")
-async def health_check():
-    db_status = await check_postgres()
-    redis_status = check_redis()
-    return {
-        "FastAPI": "Running",
-        "PostgreSQL": "Healthy" if db_status else "Down",
-        "Redis": "Healthy" if redis_status else "Down"
-    }
+# 📌 Utility Function: Generate Unique Task ID (Fix `.mp3.mp3` Issue)
+def generate_task_id(filename: str) -> str:
+    base_name, ext = os.path.splitext(to_snake_case(filename))  # 🔹 Ensure snake_case
+    unique_id = str(uuid.uuid4())[:8]  # Short UUID
+    return f"{base_name}_{unique_id}{ext}"  # ✅ Prevent `.mp3.mp3`
 
+# 📌 1️⃣ Upload a Song & Trigger Processing
 @app.post("/upload/")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), model: str = "2stems"):
+    """
+    Uploads an audio file to MinIO under the 'original-files' bucket.
+    Converts filename to snake_case.
+    Accepts model selection for Spleeter.
+    Automatically triggers Spleeter processing asynchronously.
+    """
     try:
+        # Convert to snake_case and generate Task ID
+        sanitized_filename = to_snake_case(file.filename)
+        task_id = generate_task_id(sanitized_filename)
+
+        # ✅ Ensure file_name ends in `.mp3`
+        if not task_id.endswith(".mp3"):
+            task_id += ".mp3"
+
+        # Upload to MinIO
         minio_client.put_object(
-            bucket_name=BUCKET_NAME,
-            object_name=file.filename,
-            data=file.file,
+            "original-files",
+            task_id,
+            file.file,
             length=-1,
             part_size=10 * 1024 * 1024
         )
-        return {"message": "File uploaded successfully", "filename": file.filename}
+
+        # 🔹 Store Initial Status in Redis
+        redis_client.hset(task_id, mapping={"status": "Uploaded", "progress": "0%"})
+
+        # 🔹 Asynchronously Trigger Spleeter Processing
+        try:
+            requests.post(
+                SPLEETER_SERVICE_URL,
+                params={"file_name": task_id, "model": model},
+                timeout=1  # ✅ Only wait 1 second to trigger request, then exit
+            )
+        except requests.exceptions.Timeout:
+            pass  # ✅ Ignore timeout since processing continues in the background
+
+        return {
+            "message": "Upload successful, processing started asynchronously",
+            "file_name": task_id,
+            "task_id": task_id.replace(".mp3", ""),  # ✅ Show task ID without .mp3
+            "model": model
+        }
+
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
 
-@app.get("/files/")
-async def list_files():
-    objects = minio_client.list_objects(BUCKET_NAME)
-    return [{"name": obj.object_name, "size": obj.size} for obj in objects]
-
-async def check_postgres():
+# 📌 2️⃣ List Available Songs
+@app.get("/songs/")
+def list_songs():
+    """ Lists all available songs in the 'original-files' bucket. """
     try:
-        conn = await asyncpg.connect(DATABASE_URL.replace("postgresql+asyncpg", "postgres"))
-        await conn.close()
-        return True
-    except Exception:
-        return False
+        objects = minio_client.list_objects("original-files", recursive=True)
+        return [{"song_name": obj.object_name} for obj in objects]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve songs: {str(e)}")
 
-def check_redis():
+# 📌 3️⃣ Retrieve Final Instrumental
+@app.get("/instrumentals/{song_id}/")
+def get_instrumental(song_id: str):
+    """
+    Retrieves the final instrumental for a specific song.
+    """
     try:
-        redis_client.ping()
-        return True
+        instrumental_file = f"{song_id}_instrumental.mp3"
+        minio_client.stat_object("final-instrumentals", instrumental_file)
+        return {"instrumental": instrumental_file}
     except Exception:
-        return False
+        raise HTTPException(status_code=404, detail="Instrumental not found.")
 
-@app.post("/process/{file_name}")
-def process_audio(file_name: str):
-    task = process_file.delay(file_name)
-    return {"task_id": task.id, "message": f"Spleeter processing started for {file_name}"}
-
+# 📌 2️⃣ Get Processing Status
 @app.get("/status/{task_id}")
 def get_task_status(task_id: str):
-    task_result = AsyncResult(task_id, app=process_file)
-    return {"task_id": task_id, "status": task_result.status, "result": task_result.result}
+    """ Retrieves processing status from Redis. """
+    status = redis_client.hgetall(task_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return status

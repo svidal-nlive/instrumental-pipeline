@@ -1,121 +1,142 @@
 from fastapi import FastAPI, HTTPException
 import subprocess
 import os
-import urllib.parse  # Handle spaces in filenames
-import mutagen  # Read metadata
-from mutagen.mp3 import EasyMP3
+import urllib.parse
 from minio import Minio
 import redis
-import time  # For simulating progress updates
+import time
 
 app = FastAPI()
 
-# MinIO Configuration
-MINIO_ENDPOINT = "minio:9000"
+# 📌 MinIO Configuration
+MINIO_ENDPOINT = "http://minio:9000"
 MINIO_ACCESS_KEY = "admin"
 MINIO_SECRET_KEY = "supersecret"
-BUCKET_NAME = "instrumentals"
+BUCKETS = ["original-files", "processed-stems", "final-instrumentals"]
 
-# Redis Configuration
+# 📌 Redis Configuration (For Progress Tracking)
 REDIS_HOST = "redis"
 REDIS_PORT = 6379
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
-# Initialize MinIO Client
+# 📌 Initialize MinIO Client
 minio_client = Minio(
-    MINIO_ENDPOINT,
+    MINIO_ENDPOINT.replace("http://", ""),
     access_key=MINIO_ACCESS_KEY,
     secret_key=MINIO_SECRET_KEY,
     secure=False
 )
 
-SPLEETER_AUDIO_DIR = "/spleeter_audio"
-SPLEETER_OUTPUT_DIR = f"{SPLEETER_AUDIO_DIR}/output"
+# 📌 Ensure MinIO Buckets Exist
+def create_buckets():
+    for bucket in BUCKETS:
+        if not minio_client.bucket_exists(bucket):
+            minio_client.make_bucket(bucket)
+
+create_buckets()
+
+# 📌 Define Paths
+AUDIO_FILES_DIR = "/spleeter_service/audio_files"
+SPLEETER_OUTPUT_DIR = "/spleeter_service/spleeter_audio/output"
+
+def is_valid_mp3(file_path):
+    """ Checks if an MP3 file is valid using FFmpeg. """
+    try:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", file_path, "-f", "null", "-"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+def merge_stems(task_id, stems_to_merge, output_path):
+    """ Merges non-vocal stems into a single instrumental file using FFmpeg. """
+    concat_file_path = f"{output_path}/{task_id}_concat_list.txt"
+
+    if not stems_to_merge:
+        return None  # 🔹 No stems available for merging, return None
+
+    with open(concat_file_path, "w") as f:
+        for stem in stems_to_merge:
+            if os.path.exists(stem):  # ✅ Ensure the file exists before adding
+                f.write(f"file '{stem}'\n")
+
+    final_instrumental = f"{output_path}/{task_id}_instrumental.mp3"
+
+    merge_command = [
+        "ffmpeg", "-f", "concat", "-safe", "0",
+        "-i", concat_file_path,
+        "-acodec", "libmp3lame", final_instrumental
+    ]
+
+    try:
+        subprocess.run(merge_command, check=True)
+        os.remove(concat_file_path)
+        return final_instrumental
+    except subprocess.CalledProcessError:
+        return None
 
 @app.post("/separate")
-def separate_audio(file_name: str):
-    # Decode URL-encoded filenames (e.g., "07%20-%20Green.mp3" → "07 - Green.mp3")
+def separate_audio(file_name: str, model: str = "2stems"):
+    """ Processes an audio file using Spleeter and ensures the entire pipeline runs automatically. """
+    if model not in ["2stems", "4stems", "5stems"]:
+        raise HTTPException(status_code=400, detail="Invalid model selection.")
+
     decoded_file_name = urllib.parse.unquote(file_name)
-    local_file_path = f"{SPLEETER_AUDIO_DIR}/{decoded_file_name}"
-    output_path = f"{SPLEETER_OUTPUT_DIR}/{decoded_file_name.split('.')[0]}"
+    task_id = decoded_file_name.replace(" ", "_").split(".")[0]
 
-    # Standardize output filename (replace spaces with underscores)
-    instrumental_file = decoded_file_name.replace(" ", "_").replace(".mp3", "_instrumental.mp3")
+    local_file_path = f"{AUDIO_FILES_DIR}/{decoded_file_name}"
+    output_path = f"{SPLEETER_OUTPUT_DIR}/{task_id}"
 
-    # Store initial status in Redis
-    task_id = instrumental_file
     redis_client.hset(task_id, mapping={"status": "Processing", "progress": "0%"})
 
-    # Step 1: Download file from MinIO
     try:
-        minio_client.fget_object(BUCKET_NAME, decoded_file_name, local_file_path)
+        minio_client.fget_object("original-files", decoded_file_name, local_file_path)
     except Exception as e:
         redis_client.hset(task_id, mapping={"status": "Failed", "error": str(e)})
-        raise HTTPException(status_code=404, detail=f"File not found in MinIO: {str(e)}")
+        raise HTTPException(status_code=404, detail="File not found in MinIO.")
 
-    # Step 2: Read original metadata
-    metadata = {}
-    try:
-        audio = EasyMP3(local_file_path)
-        metadata = {
-            "title": audio.get("title", ["Unknown"])[0],
-            "artist": audio.get("artist", ["Unknown"])[0],
-            "album": audio.get("album", ["Unknown"])[0]
-        }
-    except Exception as e:
-        metadata = {"error": f"Metadata extraction failed: {str(e)}"}
-
-    # Update progress
-    redis_client.hset(task_id, mapping={"progress": "20%"})
-
-    # Step 3: Run Spleeter processing
-    command = [
-        "spleeter", "separate",
-        "-p", "spleeter:2stems",
-        "-o", SPLEETER_OUTPUT_DIR,
-        local_file_path
-    ]
+    command = ["spleeter", "separate", "-p", f"spleeter:{model}", "-o", SPLEETER_OUTPUT_DIR, local_file_path]
 
     try:
         subprocess.run(command, check=True)
         redis_client.hset(task_id, mapping={"progress": "60%"})
 
-        # Convert accompaniment.wav to MP3
-        wav_file = f"{output_path}/accompaniment.wav"
-        mp3_file = f"{output_path}/accompaniment.mp3"
-        subprocess.run(["ffmpeg", "-i", wav_file, "-q:a", "2", "-map", "a", mp3_file], check=True)
+        stem_files = {
+            "2stems": ["accompaniment"],
+            "4stems": ["vocals", "drums", "bass", "other"],
+            "5stems": ["vocals", "drums", "bass", "piano", "other"]
+        }
 
-        # Apply metadata to MP3 file
-        final_mp3 = f"{SPLEETER_AUDIO_DIR}/{instrumental_file}"
-        subprocess.run(["ffmpeg", "-i", mp3_file, "-metadata", f"title={metadata['title']} - Instrumental",
-                        "-metadata", f"artist={metadata['artist']}",
-                        "-metadata", f"album={metadata['album']}",
-                        "-codec", "copy", final_mp3], check=True)
+        stems_to_merge = []
+        for stem in stem_files[model]:
+            wav_file = f"{output_path}/{stem}.wav"
+            mp3_file = f"{output_path}/{stem}.mp3"
 
-        # Upload MP3 to MinIO
-        minio_client.fput_object(BUCKET_NAME, instrumental_file, final_mp3)
+            if os.path.exists(wav_file):
+                subprocess.run(["ffmpeg", "-i", wav_file, "-q:a", "2", "-map", "a", mp3_file], check=True)
 
-        # Cleanup - Remove processed files
+                if is_valid_mp3(mp3_file):
+                    minio_client.fput_object("processed-stems", f"{task_id}/{stem}.mp3", mp3_file)
+                    if stem != "vocals":
+                        stems_to_merge.append(mp3_file)
+
+                os.remove(wav_file)
+
+        final_instrumental = merge_stems(task_id, stems_to_merge, SPLEETER_OUTPUT_DIR)
+
+        if final_instrumental:
+            minio_client.fput_object("final-instrumentals", f"{task_id}_instrumental.mp3", final_instrumental)
+            os.remove(final_instrumental)
+
         os.remove(local_file_path)
-        os.remove(wav_file)
-        os.remove(mp3_file)
-        os.remove(final_mp3)
-
         redis_client.hset(task_id, mapping={"status": "Completed", "progress": "100%"})
 
-        return {"message": "Separation & upload successful", "mp3_file": instrumental_file}
-    
+        return {"message": "Separation successful & uploaded to MinIO"}
+
     except subprocess.CalledProcessError:
         redis_client.hset(task_id, mapping={"status": "Failed", "progress": "Error"})
         raise HTTPException(status_code=500, detail="Spleeter processing failed")
-    except Exception as e:
-        redis_client.hset(task_id, mapping={"status": "Failed", "progress": "Error", "error": str(e)})
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/status/{task_id}")
-def get_task_status(task_id: str):
-    """Retrieve processing status from Redis."""
-    status = redis_client.hgetall(task_id)
-    if not status:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return status
