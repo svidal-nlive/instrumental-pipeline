@@ -1,0 +1,106 @@
+# version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    container_name: postgres_db
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio
+    container_name: minio_storage
+    restart: always
+    env_file:
+      - .env
+    command: server --console-address ":9001" /data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  minio_create_buckets:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc mb minio/${PUBLIC_ORIGINAL_BUCKET};
+      /usr/bin/mc mb minio/${PUBLIC_PROCESSED_BUCKET};
+      /usr/bin/mc mb minio/${PUBLIC_FINAL_BUCKET};
+      /usr/bin/mc mb minio/${PRIVATE_ORIGINAL_BUCKET};
+      /usr/bin/mc mb minio/${PRIVATE_PROCESSED_BUCKET};
+      /usr/bin/mc mb minio/${PRIVATE_FINAL_BUCKET};
+      /usr/bin/mc anonymous set public minio/${PUBLIC_ORIGINAL_BUCKET};
+      /usr/bin/mc anonymous set public minio/${PUBLIC_PROCESSED_BUCKET};
+      /usr/bin/mc anonymous set public minio/${PUBLIC_FINAL_BUCKET};
+      exit 0;
+      "
+
+  backend:
+    build:
+      context: ./backend
+    container_name: backend_service
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - minio
+      - redis
+
+#  frontend:
+#    build:
+#      context: ./frontend
+#    container_name: frontend_service
+#    restart: always
+#    env_file:
+#      - .env
+#    ports:
+#      - "3000:3000"
+#    depends_on:
+#      - backend
+
+  spleeter:
+    build:
+      context: ./spleeter_service
+    container_name: spleeter_service
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "5001:5001"
+    depends_on:
+      - minio
+
+  file_watcher:
+    build:
+      context: ./file_watcher
+    container_name: file_watcher
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - backend
+      - minio
+
+  redis:
+    image: redis:alpine
+    container_name: redis_cache
+    restart: always
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
+  minio_data:
