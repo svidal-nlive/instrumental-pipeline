@@ -1,5 +1,7 @@
-audio_files/*
-deemix_audio_files/*
-pdl_audio_files/*
-pretrained_models/*
-spleeter_data/output/*
+# Ignore environment files
+.env
+backend/.env
+frontend/.env.local
+file_watcher/.env
+spleeter_service/.env
+minio_storage/minio.env
