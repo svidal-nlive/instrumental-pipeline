@@ -5,3 +5,5 @@ frontend/.env.local
 file_watcher/.env
 spleeter_service/.env
 minio_storage/minio.env
+__pycache__
+venv

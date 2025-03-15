@@ -1,23 +1,26 @@
-# Backend Service Dockerfile
+# backend/Dockerfile
 FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
 
-# Copy dependency files
+# Ensure the project root is in PYTHONPATH
+ENV PYTHONPATH="/app"
+
+# Copy dependency files first (for caching)
 COPY requirements.txt .
 
-# Install dependencies
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# Copy all application files
 COPY . .
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
+# Set execute permission for the entrypoint script
+RUN chmod +x /app/entrypoint.sh
 
-# Expose FastAPI Port
+# Expose the FastAPI port
 EXPOSE 8000
 
-# Start Uvicorn server
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Set the container entrypoint
+ENTRYPOINT ["/app/entrypoint.sh"]

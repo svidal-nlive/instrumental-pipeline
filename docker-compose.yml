@@ -25,25 +25,22 @@ services:
     volumes:
       - minio_data:/data
 
-  minio_create_buckets:
-    image: minio/mc
+  # Dedicated migration service using the backend image
+  migrations:
+    build:
+      context: ./backend
+    container_name: backend_migrations
+    env_file:
+      - .env
+    volumes:
+      # Mount the versions folder from the host so that changes persist
+      - ./backend/alembic/versions:/app/alembic/versions
     depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      sleep 5;
-      /usr/bin/mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
-      /usr/bin/mc mb minio/${PUBLIC_ORIGINAL_BUCKET};
-      /usr/bin/mc mb minio/${PUBLIC_PROCESSED_BUCKET};
-      /usr/bin/mc mb minio/${PUBLIC_FINAL_BUCKET};
-      /usr/bin/mc mb minio/${PRIVATE_ORIGINAL_BUCKET};
-      /usr/bin/mc mb minio/${PRIVATE_PROCESSED_BUCKET};
-      /usr/bin/mc mb minio/${PRIVATE_FINAL_BUCKET};
-      /usr/bin/mc anonymous set public minio/${PUBLIC_ORIGINAL_BUCKET};
-      /usr/bin/mc anonymous set public minio/${PUBLIC_PROCESSED_BUCKET};
-      /usr/bin/mc anonymous set public minio/${PUBLIC_FINAL_BUCKET};
-      exit 0;
-      "
+      - db
+    # Wait for the database to be ready, then run the upgrade command.
+    # After applying migrations, adjust permissions of the mounted folder.
+    command: sh -c "sleep 10 && alembic upgrade head && chown -R ${PUID}:${PGID} /app/alembic/versions"
+    restart: "no"
 
   backend:
     build:
@@ -52,24 +49,16 @@ services:
     restart: always
     env_file:
       - .env
+    volumes:
+      # Mount the versions folder to ensure proper permissions and visibility of migration files
+      - ./backend/alembic/versions:/app/alembic/versions
     ports:
       - "8000:8000"
     depends_on:
       - db
       - minio
       - redis
-
-#  frontend:
-#    build:
-#      context: ./frontend
-#    container_name: frontend_service
-#    restart: always
-#    env_file:
-#      - .env
-#    ports:
-#      - "3000:3000"
-#    depends_on:
-#      - backend
+      - migrations
 
   spleeter:
     build:
@@ -83,13 +72,61 @@ services:
     depends_on:
       - minio
 
+  deemix:
+    image: registry.gitlab.com/bockiii/deemix-docker
+    restart: always
+    volumes:
+      - deemix_audio_files:/downloads
+      - deemix_config:/config
+    env_file:
+      - .env
+    environment:
+      - UMASK_SET=022
+      - ARL=1234567
+      - TZ=America/New_York
+      - PGID=${PGID}
+      - PUID=${PUID}
+    ports:
+      - '6595:6595'
+    container_name: deemix
+
+  playlistdl:
+    image: tanner23456/playlistdl:v2
+    container_name: playlistdl
+    user: "${PUID}:${PGID}"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    ports:
+      - "5005:5000"
+    env_file:
+      - .env
+    environment:
+      ADMIN_USERNAME: access
+      ADMIN_PASSWORD: Login@123
+      AUDIO_DOWNLOAD_PATH: /pdl_audio_files
+      CLEANUP_INTERVAL: 300
+    volumes:
+      - pdl_audio_files:/pdl_audio_files
+    restart: on-failure:5
+
   file_watcher:
     build:
       context: ./file_watcher
     container_name: file_watcher
     restart: always
+    volumes:
+      - deemix_audio_files:/deemix_audio_files
+      - pdl_audio_files:/pdl_audio_files
+      - audio_files:/audio_files
     env_file:
       - .env
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
     depends_on:
       - backend
       - minio
@@ -101,6 +138,27 @@ services:
     ports:
       - "6379:6379"
 
+  doublecommander:
+    container_name: doublecommander
+    image: ghcr.io/linuxserver/doublecommander
+    restart: always
+    ports:
+      - 3278:3000
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=America/New_York
+    volumes:
+      - doublecommander_config:/config
+      - deemix_audio_files:/data/deemix_audio_files
+      - pdl_audio_files:/data/pdl_audio_files
+      - audio_files:/data/audio_files
+
 volumes:
   postgres_data:
   minio_data:
+  deemix_audio_files:
+  pdl_audio_files:
+  audio_files:
+  deemix_config:
+  doublecommander_config:

@@ -10,3 +10,7 @@ httpx
 minio
 celery
 redis
+python-jose
+email-validator
+passlib
+python-multipart
